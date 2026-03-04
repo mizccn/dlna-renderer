@@ -9,6 +9,10 @@ import (
 	"time"
 )
 
+// transportState 记录当前播放状态，供 GetTransportInfo 返回
+// 取值: STOPPED / PLAYING / PAUSED_PLAYBACK / TRANSITIONING
+var transportState = "STOPPED"
+
 func startDLNA() {
 	// 先发一轮 byebye + alive，让局域网设备刷新
 	go func() {
@@ -37,6 +41,18 @@ func startDLNA() {
 		w.Header().Set("Content-Type", "text/xml")
 		w.WriteHeader(http.StatusOK)
 	})
+	http.HandleFunc("/RenderingControl/control", renderingControlHandler)
+	http.HandleFunc("/RenderingControl/scpd.xml", rcScpdHandler)
+	http.HandleFunc("/RenderingControl/event", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/xml")
+		w.WriteHeader(http.StatusOK)
+	})
+	http.HandleFunc("/ConnectionManager/control", connectionManagerHandler)
+	http.HandleFunc("/ConnectionManager/scpd.xml", cmScpdHandler)
+	http.HandleFunc("/ConnectionManager/event", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/xml")
+		w.WriteHeader(http.StatusOK)
+	})
 
 	appLog("INFO", fmt.Sprintf("HTTP Renderer 服务启动: http://%s:%d", localIP, httpPort))
 	go func() {
@@ -62,6 +78,8 @@ func ssdpTypes() []string {
 		deviceUUID,
 		"urn:schemas-upnp-org:device:MediaRenderer:1",
 		"urn:schemas-upnp-org:service:AVTransport:1",
+		"urn:schemas-upnp-org:service:RenderingControl:1",
+		"urn:schemas-upnp-org:service:ConnectionManager:1",
 	}
 }
 
@@ -222,7 +240,9 @@ func handleSSDPPacket(conn *net.UDPConn, src *net.UDPAddr, msg string) {
 	case "upnp:rootdevice",
 		deviceUUID,
 		"urn:schemas-upnp-org:device:MediaRenderer:1",
-		"urn:schemas-upnp-org:service:AVTransport:1":
+		"urn:schemas-upnp-org:service:AVTransport:1",
+		"urn:schemas-upnp-org:service:RenderingControl:1",
+		"urn:schemas-upnp-org:service:ConnectionManager:1":
 		sendMSearchResponse(conn, src, st)
 	default:
 		// 不响应
@@ -399,6 +419,20 @@ func descriptionHandler(w http.ResponseWriter, r *http.Request) {
         <eventSubURL>/AVTransport/event</eventSubURL>
         <SCPDURL>/AVTransport/scpd.xml</SCPDURL>
       </service>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:RenderingControl:1</serviceType>
+        <serviceId>urn:upnp-org:serviceId:RenderingControl</serviceId>
+        <controlURL>/RenderingControl/control</controlURL>
+        <eventSubURL>/RenderingControl/event</eventSubURL>
+        <SCPDURL>/RenderingControl/scpd.xml</SCPDURL>
+      </service>
+      <service>
+        <serviceType>urn:schemas-upnp-org:service:ConnectionManager:1</serviceType>
+        <serviceId>urn:upnp-org:serviceId:ConnectionManager</serviceId>
+        <controlURL>/ConnectionManager/control</controlURL>
+        <eventSubURL>/ConnectionManager/event</eventSubURL>
+        <SCPDURL>/ConnectionManager/scpd.xml</SCPDURL>
+      </service>
     </serviceList>
   </device>
 </root>`, friendlyName, deviceUUID)
@@ -466,39 +500,57 @@ func avTransportHandler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Internal Server Error", http.StatusInternalServerError)
 			return
 		}
+		transportState = "PLAYING"
 		resp = soapResp("PlayResponse")
 
 	case "Stop":
 		appLog("INFO", "[Stop] 收到停止命令")
 		sendMpvJSON(`{"command": ["stop"]}`)
+		transportState = "STOPPED"
+		currentURI = ""
 		resp = soapResp("StopResponse")
 
 	case "Pause":
 		appLog("INFO", "[Pause] 收到暂停命令")
 		sendMpvJSON(`{"command": ["cycle", "pause"]}`)
+		if transportState == "PLAYING" {
+			transportState = "PAUSED_PLAYBACK"
+		} else {
+			transportState = "PLAYING"
+		}
 		resp = soapResp("PauseResponse")
 
 	case "GetTransportInfo":
-		// 部分 App 在 Play 前会先查询状态
 		resp = `<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">` +
 			`<s:Body><u:GetTransportInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">` +
-			`<CurrentTransportState>STOPPED</CurrentTransportState>` +
+			`<CurrentTransportState>` + transportState + `</CurrentTransportState>` +
 			`<CurrentTransportStatus>OK</CurrentTransportStatus>` +
 			`<CurrentSpeed>1</CurrentSpeed>` +
 			`</u:GetTransportInfoResponse></s:Body></s:Envelope>`
 
 	case "GetCurrentTransportActions":
-		// 返回当前支持的动作列表，App 据此决定是否发送 Play
+		actions := "Play,Stop"
+		if transportState == "PLAYING" {
+			actions = "Pause,Stop,Seek"
+		} else if transportState == "PAUSED_PLAYBACK" {
+			actions = "Play,Stop,Seek"
+		}
 		resp = `<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">` +
 			`<s:Body><u:GetCurrentTransportActionsResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">` +
-			`<Actions>Play,Stop,Pause,Seek,Next,Previous</Actions>` +
+			`<Actions>` + actions + `</Actions>` +
 			`</u:GetCurrentTransportActionsResponse></s:Body></s:Envelope>`
 
 	case "GetPositionInfo":
+		trackURI := currentURI
+		track := "1"
+		if transportState == "STOPPED" {
+			trackURI = ""
+			track = "0"
+		}
 		resp = `<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">` +
 			`<s:Body><u:GetPositionInfoResponse xmlns:u="urn:schemas-upnp-org:service:AVTransport:1">` +
-			`<Track>1</Track><TrackDuration>00:00:00</TrackDuration>` +
-			`<TrackMetaData></TrackMetaData><TrackURI></TrackURI>` +
+			`<Track>` + track + `</Track><TrackDuration>00:00:00</TrackDuration>` +
+			`<TrackMetaData></TrackMetaData><TrackURI>` + trackURI + `</TrackURI>` +
 			`<RelTime>00:00:00</RelTime><AbsTime>00:00:00</AbsTime>` +
 			`<RelCount>0</RelCount><AbsCount>0</AbsCount>` +
 			`</u:GetPositionInfoResponse></s:Body></s:Envelope>`
@@ -571,4 +623,185 @@ func extractSOAPAction(body string) string {
 		}
 	}
 	return ""
+}
+
+// ========== RenderingControl ==========
+
+func renderingControlHandler(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	bodyStr := string(body)
+	action := extractSOAPAction(bodyStr)
+	if action == "" {
+		soapAction := strings.Trim(r.Header.Get("SOAPACTION"), `"`)
+		if idx := strings.LastIndex(soapAction, "#"); idx > 0 {
+			action = soapAction[idx+1:]
+		}
+	}
+	appLog("INFO", fmt.Sprintf("[RC] action=%s", action))
+
+	var resp string
+	switch action {
+	case "GetVolume":
+		resp = `<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">` +
+			`<s:Body><u:GetVolumeResponse xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1">` +
+			`<CurrentVolume>50</CurrentVolume>` +
+			`</u:GetVolumeResponse></s:Body></s:Envelope>`
+	case "SetVolume":
+		// 可以后续扩展控制 mpv 音量
+		resp = rcSoapResp("SetVolumeResponse")
+	case "GetMute":
+		resp = `<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">` +
+			`<s:Body><u:GetMuteResponse xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1">` +
+			`<CurrentMute>0</CurrentMute>` +
+			`</u:GetMuteResponse></s:Body></s:Envelope>`
+	case "SetMute":
+		resp = rcSoapResp("SetMuteResponse")
+	default:
+		resp = rcSoapResp(action + "Response")
+	}
+	w.Header().Set("Content-Type", "text/xml; charset=\"utf-8\"")
+	fmt.Fprint(w, resp)
+}
+
+func rcSoapResp(actionResp string) string {
+	return fmt.Sprintf(
+		`<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">`+
+			`<s:Body><u:%s xmlns:u="urn:schemas-upnp-org:service:RenderingControl:1"/></s:Body></s:Envelope>`,
+		actionResp)
+}
+
+func rcScpdHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/xml; charset=\"utf-8\"")
+	fmt.Fprint(w, `<?xml version="1.0" encoding="utf-8"?>
+<scpd xmlns="urn:schemas-upnp-org:service-1-0">
+  <specVersion><major>1</major><minor>0</minor></specVersion>
+  <actionList>
+    <action><n>GetVolume</n>
+      <argumentList>
+        <argument><n>InstanceID</n><direction>in</direction><relatedStateVariable>A_ARG_TYPE_InstanceID</relatedStateVariable></argument>
+        <argument><n>Channel</n><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Channel</relatedStateVariable></argument>
+        <argument><n>CurrentVolume</n><direction>out</direction><relatedStateVariable>Volume</relatedStateVariable></argument>
+      </argumentList>
+    </action>
+    <action><n>SetVolume</n>
+      <argumentList>
+        <argument><n>InstanceID</n><direction>in</direction><relatedStateVariable>A_ARG_TYPE_InstanceID</relatedStateVariable></argument>
+        <argument><n>Channel</n><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Channel</relatedStateVariable></argument>
+        <argument><n>DesiredVolume</n><direction>in</direction><relatedStateVariable>Volume</relatedStateVariable></argument>
+      </argumentList>
+    </action>
+    <action><n>GetMute</n>
+      <argumentList>
+        <argument><n>InstanceID</n><direction>in</direction><relatedStateVariable>A_ARG_TYPE_InstanceID</relatedStateVariable></argument>
+        <argument><n>Channel</n><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Channel</relatedStateVariable></argument>
+        <argument><n>CurrentMute</n><direction>out</direction><relatedStateVariable>Mute</relatedStateVariable></argument>
+      </argumentList>
+    </action>
+    <action><n>SetMute</n>
+      <argumentList>
+        <argument><n>InstanceID</n><direction>in</direction><relatedStateVariable>A_ARG_TYPE_InstanceID</relatedStateVariable></argument>
+        <argument><n>Channel</n><direction>in</direction><relatedStateVariable>A_ARG_TYPE_Channel</relatedStateVariable></argument>
+        <argument><n>DesiredMute</n><direction>in</direction><relatedStateVariable>Mute</relatedStateVariable></argument>
+      </argumentList>
+    </action>
+  </actionList>
+  <serviceStateTable>
+    <stateVariable><n>Volume</n><sendEventsAttribute>yes</sendEventsAttribute><dataType>ui2</dataType><allowedValueRange><minimum>0</minimum><maximum>100</maximum><step>1</step></allowedValueRange></stateVariable>
+    <stateVariable><n>Mute</n><sendEventsAttribute>yes</sendEventsAttribute><dataType>boolean</dataType></stateVariable>
+    <stateVariable><n>A_ARG_TYPE_InstanceID</n><sendEventsAttribute>no</sendEventsAttribute><dataType>ui4</dataType></stateVariable>
+    <stateVariable><n>A_ARG_TYPE_Channel</n><sendEventsAttribute>no</sendEventsAttribute><dataType>string</dataType></stateVariable>
+  </serviceStateTable>
+</scpd>`)
+}
+
+// ========== ConnectionManager ==========
+
+func connectionManagerHandler(w http.ResponseWriter, r *http.Request) {
+	body, _ := io.ReadAll(r.Body)
+	bodyStr := string(body)
+	action := extractSOAPAction(bodyStr)
+	if action == "" {
+		soapAction := strings.Trim(r.Header.Get("SOAPACTION"), `"`)
+		if idx := strings.LastIndex(soapAction, "#"); idx > 0 {
+			action = soapAction[idx+1:]
+		}
+	}
+	appLog("INFO", fmt.Sprintf("[CM] action=%s", action))
+
+	var resp string
+	switch action {
+	case "GetProtocolInfo":
+		resp = `<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">` +
+			`<s:Body><u:GetProtocolInfoResponse xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1">` +
+			`<Source></Source>` +
+			`<Sink>http-get:*:video/mp4:*,http-get:*:video/mpeg:*,http-get:*:video/x-msvideo:*,` +
+			`http-get:*:video/x-matroska:*,http-get:*:video/x-flv:*,http-get:*:video/quicktime:*,` +
+			`http-get:*:video/x-ms-wmv:*,http-get:*:audio/mpeg:*,http-get:*:audio/mp4:*,` +
+			`http-get:*:audio/x-flac:*,http-get:*:audio/wav:*,http-get:*:image/jpeg:*,http-get:*:*:*</Sink>` +
+			`</u:GetProtocolInfoResponse></s:Body></s:Envelope>`
+	case "GetCurrentConnectionIDs":
+		resp = `<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">` +
+			`<s:Body><u:GetCurrentConnectionIDsResponse xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1">` +
+			`<ConnectionIDs>0</ConnectionIDs>` +
+			`</u:GetCurrentConnectionIDsResponse></s:Body></s:Envelope>`
+	case "GetCurrentConnectionInfo":
+		resp = `<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">` +
+			`<s:Body><u:GetCurrentConnectionInfoResponse xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1">` +
+			`<RcsID>0</RcsID><AVTransportID>0</AVTransportID><ProtocolInfo></ProtocolInfo>` +
+			`<PeerConnectionManager></PeerConnectionManager><PeerConnectionID>-1</PeerConnectionID>` +
+			`<Direction>Input</Direction><Status>OK</Status>` +
+			`</u:GetCurrentConnectionInfoResponse></s:Body></s:Envelope>`
+	default:
+		resp = fmt.Sprintf(
+			`<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/">`+
+				`<s:Body><u:%sResponse xmlns:u="urn:schemas-upnp-org:service:ConnectionManager:1"/></s:Body></s:Envelope>`,
+			action)
+	}
+	w.Header().Set("Content-Type", "text/xml; charset=\"utf-8\"")
+	fmt.Fprint(w, resp)
+}
+
+func cmScpdHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/xml; charset=\"utf-8\"")
+	fmt.Fprint(w, `<?xml version="1.0" encoding="utf-8"?>
+<scpd xmlns="urn:schemas-upnp-org:service-1-0">
+  <specVersion><major>1</major><minor>0</minor></specVersion>
+  <actionList>
+    <action><n>GetProtocolInfo</n>
+      <argumentList>
+        <argument><n>Source</n><direction>out</direction><relatedStateVariable>SourceProtocolInfo</relatedStateVariable></argument>
+        <argument><n>Sink</n><direction>out</direction><relatedStateVariable>SinkProtocolInfo</relatedStateVariable></argument>
+      </argumentList>
+    </action>
+    <action><n>GetCurrentConnectionIDs</n>
+      <argumentList>
+        <argument><n>ConnectionIDs</n><direction>out</direction><relatedStateVariable>CurrentConnectionIDs</relatedStateVariable></argument>
+      </argumentList>
+    </action>
+    <action><n>GetCurrentConnectionInfo</n>
+      <argumentList>
+        <argument><n>ConnectionID</n><direction>in</direction><relatedStateVariable>A_ARG_TYPE_ConnectionID</relatedStateVariable></argument>
+        <argument><n>RcsID</n><direction>out</direction><relatedStateVariable>A_ARG_TYPE_RcsID</relatedStateVariable></argument>
+        <argument><n>AVTransportID</n><direction>out</direction><relatedStateVariable>A_ARG_TYPE_AVTransportID</relatedStateVariable></argument>
+        <argument><n>ProtocolInfo</n><direction>out</direction><relatedStateVariable>A_ARG_TYPE_ProtocolInfo</relatedStateVariable></argument>
+        <argument><n>PeerConnectionManager</n><direction>out</direction><relatedStateVariable>A_ARG_TYPE_ConnectionManager</relatedStateVariable></argument>
+        <argument><n>PeerConnectionID</n><direction>out</direction><relatedStateVariable>A_ARG_TYPE_ConnectionID</relatedStateVariable></argument>
+        <argument><n>Direction</n><direction>out</direction><relatedStateVariable>A_ARG_TYPE_Direction</relatedStateVariable></argument>
+        <argument><n>Status</n><direction>out</direction><relatedStateVariable>A_ARG_TYPE_ConnectionStatus</relatedStateVariable></argument>
+      </argumentList>
+    </action>
+  </actionList>
+  <serviceStateTable>
+    <stateVariable><n>SourceProtocolInfo</n><sendEventsAttribute>yes</sendEventsAttribute><dataType>string</dataType></stateVariable>
+    <stateVariable><n>SinkProtocolInfo</n><sendEventsAttribute>yes</sendEventsAttribute><dataType>string</dataType></stateVariable>
+    <stateVariable><n>CurrentConnectionIDs</n><sendEventsAttribute>yes</sendEventsAttribute><dataType>string</dataType></stateVariable>
+    <stateVariable><n>A_ARG_TYPE_ConnectionID</n><sendEventsAttribute>no</sendEventsAttribute><dataType>i4</dataType></stateVariable>
+    <stateVariable><n>A_ARG_TYPE_RcsID</n><sendEventsAttribute>no</sendEventsAttribute><dataType>i4</dataType></stateVariable>
+    <stateVariable><n>A_ARG_TYPE_AVTransportID</n><sendEventsAttribute>no</sendEventsAttribute><dataType>i4</dataType></stateVariable>
+    <stateVariable><n>A_ARG_TYPE_ProtocolInfo</n><sendEventsAttribute>no</sendEventsAttribute><dataType>string</dataType></stateVariable>
+    <stateVariable><n>A_ARG_TYPE_ConnectionManager</n><sendEventsAttribute>no</sendEventsAttribute><dataType>string</dataType></stateVariable>
+    <stateVariable><n>A_ARG_TYPE_Direction</n><sendEventsAttribute>no</sendEventsAttribute><dataType>string</dataType></stateVariable>
+    <stateVariable><n>A_ARG_TYPE_ConnectionStatus</n><sendEventsAttribute>no</sendEventsAttribute><dataType>string</dataType></stateVariable>
+  </serviceStateTable>
+</scpd>`)
 }

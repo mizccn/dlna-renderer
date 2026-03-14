@@ -3,10 +3,10 @@ package main
 import (
 	"fmt"
 	"os/exec"
+	"syscall"
 )
 
 func showNotification(title, msg string) {
-	// 使用 PowerShell 显示 Windows Toast 通知
 	script := fmt.Sprintf(`
 [Windows.UI.Notifications.ToastNotificationManager, Windows.UI.Notifications, ContentType = WindowsRuntime] | Out-Null
 [Windows.Data.Xml.Dom.XmlDocument, Windows.Data.Xml.Dom, ContentType = WindowsRuntime] | Out-Null
@@ -15,14 +15,21 @@ $template.SelectSingleNode('//text[@id=1]').InnerText = '%s'
 $template.SelectSingleNode('//text[@id=2]').InnerText = '%s'
 $notifier = [Windows.UI.Notifications.ToastNotificationManager]::CreateToastNotifier('DLNA Renderer')
 $notifier.Show([Windows.UI.Notifications.ToastNotification]::new($template))
-`, escapePS(title), escapePS(msg))
+`, psEscape(title), psEscape(msg))
 
-	cmd := exec.Command("powershell", "-WindowStyle", "Hidden", "-Command", script)
-	cmd.Run()
+	cmd := exec.Command("powershell",
+		"-NoProfile", "-NonInteractive",
+		"-WindowStyle", "Hidden",
+		"-Command", script)
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		HideWindow:    true,
+		CreationFlags: 0x08000000,
+	}
+	cmd.Start()
 	appLog("INFO", fmt.Sprintf("系统通知: %s - %s", title, msg))
 }
 
-func escapePS(s string) string {
+func psEscape(s string) string {
 	result := ""
 	for _, c := range s {
 		if c == '\'' {

@@ -5,52 +5,42 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
 )
 
 var (
-	mpvCmd     *exec.Cmd
-	pipeFile   *os.File
-	currentURI string
-	receiving  bool = true
+	mpvCmd       *exec.Cmd
+	pipeFile     *os.File
+	mpvMu        sync.Mutex
+	currentURI   string
+	receiving    bool = true
+	playStartTime time.Time
 )
 
-func initMpv() {
-	// MPV 在投屏时才启动
-}
+func initMpv() {}
 
-// restartMpv 关闭旧实例，重新启动 MPV 并重连 pipe
 func restartMpv() error {
-	// 关闭旧 pipe
 	if pipeFile != nil {
 		pipeFile.Close()
 		pipeFile = nil
 	}
-	// 杀掉旧进程
 	if mpvCmd != nil && mpvCmd.Process != nil {
 		mpvCmd.Process.Kill()
 		mpvCmd.Wait()
 		mpvCmd = nil
 	}
-
 	if _, err := os.Stat(mpvPath); os.IsNotExist(err) {
 		return fmt.Errorf("mpv.exe 未找到: %s", mpvPath)
 	}
-
-	cmd := exec.Command(mpvPath,
-		"--idle=yes",
-		"--input-ipc-server="+pipeName,
-		"--no-terminal",
-	)
-	cmd.Stdout = nil
-	cmd.Stderr = nil
+	cmd := exec.Command(mpvPath, "--idle=yes", "--input-ipc-server="+pipeName, "--no-terminal")
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
 	if err := cmd.Start(); err != nil {
 		return fmt.Errorf("启动 mpv 失败: %v", err)
 	}
 	mpvCmd = cmd
 	appLog("INFO", "mpv 已启动")
-
-	// 等待 pipe 就绪，最多等 10 秒
 	var err error
 	for i := 0; i < 20; i++ {
 		pipeFile, err = os.OpenFile(pipeName, os.O_WRONLY, 0666)
@@ -66,24 +56,31 @@ func restartMpv() error {
 	return nil
 }
 
-// isMpvAlive 检查 mpv 进程和 pipe 是否仍然有效
+// isMpvAlive 用 Windows API 检查进程是否存活，避免 pipe deadline 挂起
 func isMpvAlive() bool {
 	if mpvCmd == nil || mpvCmd.Process == nil || pipeFile == nil {
 		return false
 	}
-	// 尝试发一个空 ping（发送换行，mpv 会忽略空行）
-	pipeFile.SetWriteDeadline(time.Now().Add(500 * time.Millisecond))
-	_, err := pipeFile.Write([]byte("\n"))
-	pipeFile.SetWriteDeadline(time.Time{}) // 清除 deadline
-	if err != nil {
-		appLog("INFO", "检测到 mpv pipe 已断开: "+err.Error())
-		return false
-	}
-	return true
+	return isProcAliveWin(mpvCmd.Process.Pid)
 }
 
-// sendMpvJSON 发送命令，pipe 断开时自动重连重试一次
+func isProcAliveWin(pid int) bool {
+	kernel32 := syscall.NewLazyDLL("kernel32.dll")
+	openProcess := kernel32.NewProc("OpenProcess")
+	waitForSingle := kernel32.NewProc("WaitForSingleObject")
+	closeHandle := kernel32.NewProc("CloseHandle")
+	handle, _, _ := openProcess.Call(0x1000, 0, uintptr(pid))
+	if handle == 0 {
+		return false
+	}
+	defer closeHandle.Call(handle)
+	ret, _, _ := waitForSingle.Call(handle, 0)
+	return ret == 0x102 // WAIT_TIMEOUT = 进程仍在运行
+}
+
 func sendMpvJSON(json string) error {
+	mpvMu.Lock()
+	defer mpvMu.Unlock()
 	if !isMpvAlive() {
 		appLog("INFO", "mpv 未运行，尝试重启...")
 		if err := restartMpv(); err != nil {
@@ -92,8 +89,7 @@ func sendMpvJSON(json string) error {
 	}
 	_, err := pipeFile.Write([]byte(json + "\n"))
 	if err != nil {
-		// 第一次失败：重启后再试一次
-		appLog("WARN", "mpv 命令发送失败，重启 mpv 重试: "+err.Error())
+		appLog("WARN", "mpv 命令发送失败，重启重试: "+err.Error())
 		if err2 := restartMpv(); err2 != nil {
 			return fmt.Errorf("重启 mpv 失败: %v", err2)
 		}
@@ -109,12 +105,30 @@ func sendMpvJSON(json string) error {
 func playURI(uri string) error {
 	jsonCmd := fmt.Sprintf(`{"command": ["loadfile", "%s", "replace"]}`,
 		strings.ReplaceAll(uri, `"`, `\"`))
-	return sendMpvJSON(jsonCmd)
+	if err := sendMpvJSON(jsonCmd); err != nil {
+		return err
+	}
+	playStartTime = time.Now()
+	return nil
+}
+
+// getMpvTimePos 返回估算播放进度，让 App 知道播放在进行中
+func getMpvTimePos() string {
+	if playStartTime.IsZero() {
+		return ""
+	}
+	secs := int(time.Since(playStartTime).Seconds())
+	if secs < 0 {
+		secs = 0
+	}
+	return fmt.Sprintf("%02d:%02d:%02d", secs/3600, (secs%3600)/60, secs%60)
 }
 
 func cleanup() {
+	mpvMu.Lock()
+	defer mpvMu.Unlock()
 	if pipeFile != nil {
-		sendMpvJSON(`{"command": ["quit"]}`)
+		pipeFile.Write([]byte(`{"command": ["quit"]}` + "\n"))
 		pipeFile.Close()
 		pipeFile = nil
 	}
